@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chicken Jump</title>
+<style>
+:root{--bg:#f7f7f7;--fg:#535353;--muted:#9a9a9a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#202124;--fg:#e8e8e8;--muted:#777}}
+:root[data-theme="dark"]{--bg:#202124;--fg:#e8e8e8;--muted:#777}
+html,body{height:100%;margin:0}
+body{outline:none;background:var(--bg);color:var(--fg);font-family:"Courier New",monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;user-select:none;-webkit-user-select:none;touch-action:manipulation}
+canvas{width:min(94vw,800px);max-width:100%;height:auto;aspect-ratio:800/260;display:block}
+p{color:var(--muted);font-size:13px;margin:12px 0 0;text-align:center}
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="260"></canvas>
+<p>Space / ↑ / tap to jump &nbsp;·&nbsp; ↓ to duck &nbsp;·&nbsp; M to mute<br>Jump for the corn 🌽 to be invincible for 3 seconds</p>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const W=800,H=260,GY=215,G=0.65;
+// gently rolling terrain: height of the ground surface at screen x (scrolls with distance travelled)
+let strikeChance=0.02,strikeT=0,bolt=[];            // chance (0 to 1) that grabbing corn gets the chicken struck by lightning; currently 2%
+const START_SPEED=3.5;                          // gentle opening pace; speeds up gradually as the score climbs
+const CD0=160;                                   // starting scroll offset for the cutscene (frames the farm nicely behind the chicken)
+let X0=0,X1=W,cutT=0,cutSpeed=0,foxLift=0; // visible world range (wider in the cutscene), cutscene clock, fox pounce height
+function groundAt(x){return GY-12*Math.sin((x+dist)/230)-5*Math.sin((x+dist)/95)}
+let hi=0;
+try{hi=+localStorage.getItem('dinohi')||0}catch(e){}
+let corn=[],sparks=[],power=0,cornIn=600,killer='',snatchT=0,hawk=null,particles=[],eatT=0,chickenGone=false,dist=0,fox,hist,dino,obs,clouds,speed,score,frames,state,spawnIn;
+
+function reset(){
+  dist=0;fox={x:34};particles=[];eatT=0;chickenGone=false;snatchT=0;hawk=null;killer='';strikeT=0;corn=[];sparks=[];power=0;cornIn=500+Math.random()*400;hist=[];
+  dino={x:140,y:groundAt(160),vy:0,w:40,h:44,duck:false,onGround:true};
+  obs=[];clouds=[{x:200,y:60},{x:550,y:90}];
+  speed=START_SPEED;score=0;frames=0;spawnIn=60;state='run';
+}
+function color(){return getComputedStyle(document.documentElement).getPropertyValue('--fg').trim()||'#535353'}
+
+// ---- sound effects (synthesized with Web Audio, no files needed) ----
+let AC=null,muted=false,NB=null;
+function audio(){
+  if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)()}catch(e){return null}}
+  if(AC.state==='suspended')AC.resume();
+  return AC;
+}
+function tone(o){
+  const a=audio();if(!a||muted)return;
+  const t=a.currentTime+(o.d||0),osc=a.createOscillator(),g=a.createGain();
+  osc.type=o.type||'square';
+  osc.frequency.setValueAtTime(o.f0,t);osc.frequency.exponentialRampToValueAtTime(o.f1||o.f0,t+o.dur);
+  if(o.vib){const l=a.createOscillator(),lg=a.createGain();l.frequency.value=o.vibHz||20;lg.gain.value=o.vib;l.connect(lg);lg.connect(osc.frequency);l.start(t);l.stop(t+o.dur+.05)}
+  g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(o.vol||0.15,t+0.01);g.gain.exponentialRampToValueAtTime(0.0001,t+o.dur);
+  let n=osc;
+  if(o.bp){const f=a.createBiquadFilter();f.type='bandpass';f.frequency.value=o.bp;f.Q.value=o.q||1;osc.connect(f);n=f}
+  n.connect(g);g.connect(a.destination);osc.start(t);osc.stop(t+o.dur+.05);
+}
+function noise(o){
+  const a=audio();if(!a||muted)return;
+  if(!NB){NB=a.createBuffer(1,a.sampleRate,a.sampleRate);const d=NB.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1}
+  const t=a.currentTime+(o.d||0),s=a.createBufferSource(),f=a.createBiquadFilter(),g=a.createGain();
+  s.buffer=NB;f.type=o.ft||'lowpass';f.frequency.setValueAtTime(o.f0,t);if(o.f1)f.frequency.exponentialRampToValueAtTime(o.f1,t+o.dur);
+  g.gain.setValueAtTime(o.vol||0.2,t);g.gain.exponentialRampToValueAtTime(0.0001,t+o.dur);
+  s.connect(f);f.connect(g);g.connect(a.destination);s.start(t);s.stop(t+o.dur+.05);
+}
+function sndJump(){tone({type:'square',f0:320,f1:720,dur:.14,vol:.06});tone({type:'triangle',f0:640,f1:1100,dur:.1,vol:.05,d:.03})}     // bouncy "bok"
+function sndSquawk(){                                                                                                                     // panicked chicken squawk
+  tone({type:'sawtooth',f0:650,f1:1000,dur:.5,vol:.12,vib:260,vibHz:28,bp:1600,q:.8});
+  tone({type:'square',f0:900,f1:600,dur:.4,vol:.05,vib:180,vibHz:35,d:.05,bp:1800});
+  noise({ft:'bandpass',f0:2000,dur:.35,vol:.05});
+}
+function sndHawk(){                                                                                                                       // red-tailed hawk "kree-eee"
+  tone({type:'sawtooth',f0:3300,f1:1500,dur:1.1,vol:.07,vib:150,vibHz:14,bp:2400,q:.7});
+  tone({type:'square',f0:2900,f1:1700,dur:.9,vol:.025,vib:90,vibHz:18,d:.04,bp:2600});
+  noise({ft:'bandpass',f0:3200,dur:1,vol:.05});
+}
+function sndPower(){[523,659,784,1047].forEach((f,i)=>tone({type:'triangle',f0:f,f1:f*1.02,dur:.14,vol:.09,d:i*.07}))}   // ascending power-up arpeggio
+function sndYelp(){                                                                                                                      // startled yelp as the predator bolts
+  if(pred==='bear'){tone({type:'sawtooth',f0:320,f1:150,dur:.4,vol:.1,bp:400,vib:30,vibHz:22})}
+  else if(pred==='raccoon'){for(let i=0;i<4;i++)tone({type:'square',f0:1700,f1:1200,dur:.05,vol:.05,bp:1700,d:i*.06})}
+  else{tone({type:'sawtooth',f0:1100,f1:520,dur:.3,vol:.09,bp:1000});tone({type:'square',f0:1300,f1:700,dur:.2,vol:.05,d:.12,bp:1200})}
+}
+function sndThunder(){                                                                                                                   // zap, crack, then a long rumble
+  tone({type:'sawtooth',f0:3200,f1:180,dur:.28,vol:.12});
+  noise({ft:'lowpass',f0:5000,f1:200,dur:.18,vol:.5});
+  noise({ft:'lowpass',f0:500,f1:50,dur:1.8,vol:.4,d:.15});
+  tone({type:'sine',f0:70,f1:35,dur:1.4,vol:.25,d:.12});
+}
+function sndPowerEnd(){tone({type:'triangle',f0:660,f1:440,dur:.18,vol:.07});tone({type:'triangle',f0:440,f1:294,dur:.22,vol:.07,d:.12})}
+function sndPeck(){tone({type:'square',f0:950,f1:480,dur:.045,vol:.08})}
+function sndRustle(){noise({ft:'bandpass',f0:3500,dur:.4,vol:.07});noise({ft:'bandpass',f0:2500,dur:.3,vol:.05,d:.2})}
+function sndPounce(){
+  noise({ft:'bandpass',f0:500,f1:2600,dur:.3,vol:.12});
+  if(pred==='bear')tone({type:'sawtooth',f0:110,f1:55,dur:.55,vol:.12,vib:25,vibHz:30,bp:300});                       // low growl
+  else if(pred==='coyote'){tone({type:'square',f0:700,f1:1300,dur:.14,vol:.06,bp:1200});tone({type:'square',f0:800,f1:1500,dur:.16,vol:.06,bp:1300,d:.17})}   // yips
+  else if(pred==='raccoon'){for(let i=0;i<5;i++)tone({type:'square',f0:1500,f1:1100,dur:.05,vol:.05,bp:1600,d:i*.07})}   // chittering
+  else tone({type:'sawtooth',f0:240,f1:110,dur:.28,vol:.07,bp:600});                                                 // fox snarl
+}
+function sndChomp(v=1){                                                                                                                   // two snapping bites
+  for(let i=0;i<2;i++){
+    noise({ft:'lowpass',f0:1800,f1:300,dur:.12,vol:.35*v,d:i*.13});
+    tone({type:'square',f0:170,f1:70,dur:.1,vol:.16*v,d:i*.13});
+  }
+}
+
+function jump(){
+  if(state==='cutscene'){skipCutscene();return}                       // second press skips the intro
+  if(state==='eating'||state==='snatched'||state==='struck')return;
+  if(state==='over'){pickPred();startCutscene();return}                         // every restart replays the intro
+  if(state==='idle'){startCutscene();return}                         // first press plays the intro
+  if(dino.onGround){dino.vy=-12.5;dino.onGround=false;sndJump()}
+}
+const isJump=e=>e.code==='Space'||e.code==='ArrowUp'||e.key===' '||e.key==='Spacebar'||e.key==='ArrowUp';
+const isDown=e=>e.code==='ArrowDown'||e.key==='ArrowDown';
+function onKeyDown(e){
+  if(e.code==='KeyM'){muted=!muted;return}
+  if(isJump(e)){e.preventDefault();if(!e.repeat)jump()}
+  else if(isDown(e)){e.preventDefault();dino.duck=true;if(!dino.onGround)dino.vy+=3}
+}
+function onKeyUp(e){if(isDown(e))dino.duck=false}
+// listen on window and document, capture phase, so focus quirks can't swallow keys
+window.addEventListener('keydown',onKeyDown,true);
+document.addEventListener('keyup',onKeyUp,true);
+window.addEventListener('keyup',onKeyUp,true);
+// make sure the page (and any embedding frame) holds keyboard focus
+document.body.tabIndex=0;
+function grabFocus(){try{window.focus();document.body.focus({preventScroll:true})}catch(e){}}
+grabFocus();
+['pointerdown','mousedown','touchstart','click'].forEach(ev=>window.addEventListener(ev,grabFocus,{passive:true}));
+cv.addEventListener('pointerdown',e=>{e.preventDefault();jump()});
+
+function spawn(){
+  if(score>300&&Math.random()<0.25){
+    const offs=[20,50,75];
+    obs.push({type:'bird',x:W+20,y:0,off:offs[Math.floor(Math.random()*3)],w:50,h:38});
+  }else{
+    const n=1+Math.floor(Math.random()*(speed>=4.4?3:2));   // big clusters only once the jump can clear them
+    obs.push({type:'egg',x:W+20,y:groundAt(W+20+17*n),w:34*n,h:36,n});
+  }
+  spawnIn=Math.max(35,(55+Math.random()*60)*(6/speed)+25);
+}
+
+function hitbox(){
+  const h=dino.duck&&dino.onGround?26:dino.h;
+  return{x:dino.x+6,y:dino.y-h+4,w:dino.w-12,h:h-8};
+}
+function overlap(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y}
+
+// ---- opening cutscene ----
+const startX=()=>pred==='bear'?4:-20;                                // where the predator waits behind the bush
+function startCutscene(){
+  audio();
+  reset();dist=CD0;state='cutscene';cutT=0;cutSpeed=0;foxLift=0;
+  obs=[];corn=[];sparks=[];particles=[];
+  dino.x=140;dino.y=groundAt(160);dino.onGround=true;fox.x=startX();      // predator hides behind the bush
+}
+function beginGameplay(){
+  state='run';speed=START_SPEED;cutSpeed=0;foxLift=0;fox.x=34;
+  dino.x=140;dino.duck=false;dino.vy=0;dino.onGround=true;dino.y=groundAt(160);
+  hist=[];obs=[];corn=[];sparks=[];particles=[];spawnIn=60;cornIn=500+Math.random()*400;
+}
+function skipCutscene(){beginGameplay()}
+const CS=0.6;                                                         // cutscene speed: 1 = original pace, lower = slower
+function updateCutscene(){
+  const tp=cutT;cutT+=CS;const t=cutT,bx=-15-(dist-CD0);
+  const at=n=>tp<n&&t>=n;                                             // true on the frame the clock passes n
+  if(at(16)||at(50)||at(84)){                                         // three pecks, each flicks up a few crumbs
+    sndPeck();
+    for(let i=0;i<4;i++)sparks.push({x:dino.x+44,y:dino.y-3,vx:(Math.random()-.3)*2.5,vy:-1-Math.random()*1.8,l:22/CS,c:i%2?'#e8c77a':'#8a5a2b'});
+  }
+  if(at(96))sndRustle();                                              // bush starts to rustle
+  if(t>=96&&t<122&&Math.floor(t/3)!==Math.floor(tp/3))sparks.push({x:bx+10+Math.random()*60,y:groundAt(bx+40)-55,vx:(Math.random()-.5)*2,vy:-.5-Math.random(),l:26/CS,c:'#4caf50'});
+  if(at(118))sndPounce();
+  if(at(132)&&pred==='bear'){sndRustle();for(let i=0;i<16;i++)sparks.push({x:bx+10+Math.random()*80,y:groundAt(bx+40)-30-Math.random()*60,vx:(Math.random()-.5)*5,vy:-Math.random()*3,l:30/CS,c:i%2?'#4caf50':'#66c25a'})}   // bear crashes through the bush
+  if(at(124)){dino.vy=-7.5;dino.onGround=false;sndSquawk()}          // chicken jumps in fright
+  if(t>=118&&t<152){const u=(t-118)/34;fox.x=startX()+(50-startX())*u;foxLift=Math.round((pred==='bear'?14:30)*4*u*(1-u))}  // fox leaps out in an arc
+  else if(t>=152){foxLift=0;fox.x+=(34-fox.x)*(1-Math.pow(0.96,CS))}
+  const gc=groundAt(dino.x+20);
+  if(dino.onGround){dino.y=gc;dino.vy=0}
+  else{dino.vy+=G*CS;dino.y+=dino.vy*CS;if(dino.y>=gc){dino.y=gc;dino.vy=0;dino.onGround=true}}
+  if(t>=152){frames++;cutSpeed=Math.min(START_SPEED,(t-152)*0.1);dist+=cutSpeed}   // chicken runs: the world starts scrolling
+  sparks.forEach(p=>{p.x+=p.vx*CS;p.y+=p.vy*CS;p.vy+=0.12*CS;p.l-=1});sparks=sparks.filter(p=>p.l>0);
+  if(t>=215)beginGameplay();
+}
+function camera(){                                                    // slow push-in, then pull back out to the normal view
+  const t=cutT;const big=pred==='bear';                                            // pull back further for the big bear
+  let z=(2.0+0.12*Math.min(t/120,1))*(big?0.85:1),sx=440,sy=big?190:182;
+  const u=Math.max(0,Math.min(1,(t-150)/60)),e=u*u*(3-2*u);
+  return{z:z+(1-z)*e,sx:sx+(160-sx)*e,sy:sy+(185-sy)*e};
+}
+function peckAmount(t){if(t>=100||t<8)return 0;const c=(t-8)%34;return c<16?Math.sin(Math.PI*c/16):0}
+function drawChickenPeck(t){
+  const {x,y}=dino,p=peckAmount(t),dx=Math.round(6*p),dy=Math.round(22*p);
+  const BODY='#d9a441',WING='#b9802a',RED='#d93a2f',ORANGE='#f08a24';
+  const seeds=3-(t>=16)-(t>=50)-(t>=84);                              // crumbs on the ground get eaten
+  ctx.fillStyle='#e8c77a';
+  if(seeds>=1)px(x+42,y-2,2,2);if(seeds>=2)px(x+45,y-2,2,2);if(seeds>=3)px(x+43,y-4,2,2);
+  ctx.fillStyle=WING;px(x,y-36-Math.round(p*3),7,14);px(x-4,y-40-Math.round(p*3),6,10);   // tail lifts a little
+  ctx.fillStyle=BODY;px(x+6,y-30,26,20);px(x+10,y-12,18,4);
+  const nt=y-44+dy+10,nb=y-26;if(nt<nb)px(x+24,nt,8,nb-nt);                                // neck stretches down
+  px(x+26+dx,y-44+dy,12,18);
+  ctx.fillStyle=WING;px(x+12,y-26,12,10);
+  ctx.fillStyle=RED;px(x+28+dx,y-49+dy,3,6);px(x+32+dx,y-47+dy,3,4);px(x+36+dx,y-34+dy,3,5);
+  ctx.fillStyle=ORANGE;
+  if(p<0.5)px(x+38+dx,y-39+dy,6,4);else px(x+34+dx,y-26+dy,4,4);                           // beak points down when pecking
+  px(x+14,y-8,3,8);px(x+24,y-8,3,5);px(x+14,y-2,7,2);px(x+24,y-5,7,2);
+  ctx.fillStyle=color();px(x+33+dx,y-40+dy,3,3);
+  ctx.fillStyle=color();
+}
+function drawBush(){
+  const t=cutT,sh=(t>=96&&t<122)?Math.round(Math.sin(t*1.9)*2.5):0;
+  const bx=-15-(dist-CD0)+sh,by=groundAt(bx+40)+3,sc=pred==='bear'?1.5:1;
+  ctx.save();ctx.translate(bx+43,by);ctx.scale(sc,sc);ctx.translate(-(bx+43),-by);                // the bear needs a bigger bush
+  blob(bx+16,by-20,20,20,'#2f7d2e');blob(bx+66,by-20,20,20,'#2f7d2e');blob(bx+42,by-32,28,30,'#3f9b3a');blob(bx+40,by-14,38,16,'#3f9b3a');
+  blob(bx+34,by-42,11,8,'#66c25a');blob(bx+58,by-32,8,6,'#66c25a');blob(bx+14,by-28,7,5,'#66c25a');
+  ctx.fillStyle='#d93a2f';px(bx+24,by-24,3,3);px(bx+52,by-16,3,3);px(bx+70,by-26,3,3);px(bx+40,by-30,3,3);   // berries
+  ctx.restore();ctx.fillStyle=color();
+}
+function drawCutOverlay(){
+  ctx.fillStyle='#000';ctx.fillRect(0,0,W,24);ctx.fillRect(0,H-24,W,24);                    // letterbox bars
+  if(cutT<30){ctx.globalAlpha=1-cutT/30;ctx.fillRect(0,0,W,H);ctx.globalAlpha=1}           // fade in from black
+  ctx.fillStyle='#ddd';ctx.font='12px "Courier New",monospace';ctx.textAlign='right';ctx.fillText('SPACE to skip \u25B8\u25B8',W-12,H-8);
+  ctx.fillStyle=color();
+}
+
+function startStrike(){
+  state='struck';strikeT=0;killer='lightning';chickenGone=false;power=0;dino.duck=false;
+  bolt=[{x:dino.x+22,y:-10}];                                       // jagged bolt from the sky down to the chicken's head
+  const ty=dino.y-50;for(let i=1;i<=9;i++)bolt.push({x:dino.x+22+(i<9?(Math.random()-.5)*34:0),y:-10+(ty+10)*i/9});
+  for(let i=0;i<26;i++)sparks.push({x:dino.x+22,y:dino.y-30,vx:(Math.random()-.5)*8,vy:(Math.random()-.5)*8,l:22,c:i%2?'#9fd0ff':'#fff'});
+  sndThunder();
+}
+function drawSkeleton(){                                            // x-ray flash while the current passes through
+  const {x,y}=dino;
+  ctx.fillStyle='rgba(20,17,15,0.75)';px(x-6,y-52,54,54);
+  ctx.fillStyle='#f4f1ea';
+  px(x+26,y-44,12,14);px(x+38,y-38,6,3);px(x+30,y-30,3,8);          // skull, beak, neck
+  px(x+8,y-26,24,3);px(x,y-34,10,2);px(x-4,y-38,2,6);               // spine, tail
+  for(let k=0;k<4;k++)px(x+12+k*5,y-26,2,12);                        // ribs
+  px(x+16,y-12,2,12);px(x+26,y-12,2,12);px(x+13,y-2,8,2);px(x+23,y-2,8,2);   // legs, feet
+  ctx.fillStyle='#14110f';px(x+31,y-40,4,4);                         // eye socket
+  ctx.fillStyle=color();
+}
+function drawCooked(yo=0){                                         // roast chicken lying on its back, drumsticks in the air
+  const cx=dino.x-4,y=dino.y+yo;
+  ctx.fillStyle='#8a4616';px(cx-4,y-16,6,8);px(cx+38,y-16,6,8);px(cx+42,y-14,6,8);               // wings tucked at the sides, tail stub
+  ctx.fillStyle='#b8651e';px(cx+6,y-24,28,4);px(cx,y-20,40,14);px(cx+4,y-6,32,4);                 // roasted body
+  ctx.fillStyle='#e3a043';px(cx+8,y-22,24,3);px(cx+4,y-17,32,2);                                  // golden shine on the belly
+  ctx.fillStyle='#7a3a12';px(cx+10,y-19,3,10);px(cx+18,y-19,3,10);px(cx+26,y-19,3,10);px(cx+33,y-19,3,10);   // grill marks
+  ctx.fillStyle='#c9772a';px(cx+10,y-33,8,10);px(cx+26,y-34,8,11);                                // drumsticks
+  ctx.fillStyle='#f4f1ea';px(cx+12,y-39,3,7);px(cx+11,y-42,5,3);px(cx+28,y-41,3,8);px(cx+27,y-44,5,3);   // bones with knuckles
+  ctx.fillStyle='#9a5a22';px(cx-6,y-8,8,6);px(cx-16,y-12,12,12);                                 // neck and head flopped to the left
+  ctx.fillStyle='#6b2a18';px(cx-14,y-16,3,5);px(cx-10,y-15,3,4);                                  // cooked comb
+  ctx.fillStyle='#a86a22';px(cx-22,y-8,6,3);                                                      // beak
+  ctx.fillStyle='#2b1a0f';px(cx-13,y-10,1,1);px(cx-11,y-10,1,1);px(cx-12,y-9,1,1);px(cx-13,y-8,1,1);px(cx-11,y-8,1,1);   // x-ed out eye
+  ctx.fillStyle=color();
+}
+function drawStrike(){
+  const t=strikeT;
+  const tint=Math.max(0,0.35*(1-t/110));ctx.fillStyle='rgba(8,12,35,'+tint+')';ctx.fillRect(0,0,W,H);   // storm gloom fades out
+  if(t<20&&(t<9||t%4<2)){                                           // the bolt flickers
+    ctx.lineJoin='miter';
+    ctx.strokeStyle='rgba(150,200,255,0.5)';ctx.lineWidth=14;ctx.beginPath();bolt.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke();
+    ctx.strokeStyle='#fff';ctx.lineWidth=4;ctx.beginPath();bolt.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke();
+  }
+  const fl=t<7?(1-t/7):(t>=11&&t<15?0.5*(1-(t-11)/4):0);              // two white flashes
+  if(fl>0){ctx.fillStyle='rgba(255,255,255,'+(0.85*fl)+')';ctx.fillRect(0,0,W,H)}
+  ctx.fillStyle=color();
+}
+function update(dt=16.7){
+  if(state==='cutscene'){updateCutscene();return}
+  if(state==='struck'){                                              // lightning strike: flash, x-ray, scorched chicken
+    strikeT++;
+    if(strikeT<12)foxLift=Math.round((pred==='bear'?7:20)*Math.sin(Math.PI*strikeT/12));        // predator jumps in fright
+    else{                                                           // then bolts away to the left, faster and faster
+      foxLift=0;if(strikeT===12)sndYelp();
+      if(fox.x>-260)fox.x-=2.5+(strikeT-12)*0.25;
+    }
+    sparks.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.l--});sparks=sparks.filter(p=>p.l>0);
+    particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vx*=0.98;p.vy=Math.min(1.2,p.vy+0.12);{const g=groundAt(p.x)-2;if(p.y>=g){p.y=g;p.vx=0;p.vy=0}}});
+    {const gc=groundAt(dino.x+20);dino.vy+=G;dino.y=Math.min(gc,dino.y+dino.vy);if(dino.y>=gc){dino.y=gc;dino.vy=0;dino.onGround=true}}
+    if(strikeT===30)for(let i=0;i<14;i++)particles.push({x:dino.x+20,y:dino.y-28,vx:(Math.random()-.5)*6,vy:-Math.random()*4-1,c:i%2?'#7a5a3a':'#e8c77a'});   // singed feathers
+    if(strikeT>=30&&strikeT%5===0)sparks.push({x:dino.x+8+Math.random()*30,y:dino.y-42-Math.random()*8,vx:(Math.random()-.5)*.6,vy:-.6,l:44,c:Math.random()<.5?'#f0f0f0':'#c8c8c8'});   // smoke
+    if(strikeT>=100)state='over';
+    return;
+  }
+  if(state==='snatched'){                                           // hawk snatches the chicken and flies away
+    snatchT++;if(snatchT===10)sndSquawk();
+    particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vx*=0.98;p.vy=Math.min(1.2,p.vy+0.12);{const g=groundAt(p.x)-2;if(p.y>=g){p.y=g;p.vx=0;p.vy=0}}});
+    if(snatchT<16){                                                 // swoop down onto the chicken
+      dino.vy+=G;{const gc=groundAt(dino.x+20);dino.y=Math.min(gc,dino.y+dino.vy);if(dino.y>=gc){dino.y=gc;dino.vy=0;dino.onGround=true}}
+      hawk.x+=(dino.x-2-hawk.x)*0.3;hawk.y+=(dino.y-56-hawk.y)*0.3;
+      fox.x+=(dino.x-80-fox.x)*0.2;
+    }else{                                                          // carry it up and off to the left
+      const t=snatchT-16;
+      if(t===0)for(let i=0;i<12;i++)particles.push({x:dino.x+20,y:dino.y-28,vx:(Math.random()-.5)*6,vy:-Math.random()*4-1,c:i%2?'#ffffff':'#e8c77a'});
+      hawk.x-=2.5+t*0.12;hawk.y-=1.2+t*0.05;
+      dino.x=hawk.x+2+Math.round(Math.sin(t*0.3)*3);dino.y=hawk.y+56;
+      if(snatchT%4===0)particles.push({x:dino.x+20,y:dino.y-30,vx:1+Math.random(),vy:0,c:snatchT%8?'#ffffff':'#e8c77a'});
+    }
+    if(snatchT>=76){state='over';chickenGone=true;dino.x=fox.x+80;dino.y=groundAt(dino.x+20);dino.vy=0;dino.onGround=true}
+    return;
+  }
+  if(state==='eating'||state==='over'){
+    if(killer!=='lightning')fox.x+=(dino.x-80-fox.x)*0.2;           // predator lunges at the chicken (not after a lightning strike)
+    if(killer==='lightning'){sparks.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.l--});sparks=sparks.filter(p=>p.l>0);if(frames%7===0)sparks.push({x:dino.x+8+Math.random()*30,y:dino.y-42-Math.random()*8,vx:(Math.random()-.5)*.6,vy:-.6,l:44,c:Math.random()<.5?'#f0f0f0':'#c8c8c8'});frames++}   // keep smoking
+    dino.vy+=G;{const gc=groundAt(dino.x+20);dino.y=Math.min(gc,dino.y+dino.vy);if(dino.y>=gc){dino.y=gc;dino.vy=0;dino.onGround=true}}
+    particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vx*=0.98;p.vy=Math.min(1.2,p.vy+0.12);{const g=groundAt(p.x)-2;if(p.y>=g){p.y=g;p.vx=0;p.vy=0}}});
+    if(state==='eating'){
+      eatT++;if(eatT===28)sndChomp(1);if(eatT===40||eatT===52)sndChomp(.4);
+      if(eatT===28){                                                // chomp: chicken vanishes in a puff of feathers
+        chickenGone=true;
+        for(let i=0;i<18;i++)particles.push({x:dino.x+20,y:dino.y-24,vx:(Math.random()-.5)*7,vy:-Math.random()*5-1,c:i%2?'#ffffff':'#e8c77a'});
+      }
+      if(eatT>=100)state='over';
+    }
+    return;
+  }
+  if(state!=='run')return;
+  if(power>0){power-=dt;if(power<=0){power=0;sndPowerEnd()}}          // invincibility countdown (real time)
+  frames++;dist+=speed;score+=speed*0.04;speed=Math.min(16,START_SPEED+score/100);
+  const gc=groundAt(dino.x+20);
+  if(dino.onGround){dino.y=gc;dino.vy=0}                             // follow the slope while running
+  else{dino.vy+=G;dino.y+=dino.vy;if(dino.y>=gc){dino.y=gc;dino.vy=0;dino.onGround=true}}
+  hist.push(dino.y-gc);if(hist.length>40)hist.shift();
+  if(--spawnIn<=0)spawn();
+  if(--cornIn<=0){                                                   // corn cob floats at jump height
+    if(obs.every(o=>o.x<W-260)){corn.push({x:W+30,y:0,off:72+Math.random()*16});cornIn=700+Math.random()*700}
+    else cornIn=20;
+  }
+  corn.forEach(c=>{c.x-=speed;if(c.off!=null)c.y=groundAt(c.x)-c.off});corn=corn.filter(c=>c.x>-30);
+  sparks.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.l--});sparks=sparks.filter(p=>p.l>0);
+  if(power>0&&frames%3===0)sparks.push({x:dino.x+8+Math.random()*28,y:dino.y-50*Math.random(),vx:-speed*0.3,vy:-0.6,l:18,c:Math.random()<.5?'#ffd23f':'#fff'});
+  obs.forEach(o=>{o.x-=speed;if(o.type==='egg')o.y=groundAt(o.x+o.w/2);else if(o.off!=null)o.y=groundAt(o.x+25)-o.off});
+  obs=obs.filter(o=>o.x+o.w>-20);
+  clouds.forEach(c=>{c.x-=speed*0.2;if(c.x<-60){c.x=W+40;c.y=40+Math.random()*70}});
+  const hb=hitbox();
+  for(const c of corn){                                              // grab the corn mid-jump
+    if(overlap(hb,{x:c.x-2,y:c.y-36,w:18,h:40})){
+      c.got=true;
+      if(Math.random()<strikeChance)startStrike();                 // 1 in 100: struck by lightning instead of powered up
+      else{
+        power=3000;sndPower();
+        for(let i=0;i<16;i++)sparks.push({x:c.x+6,y:c.y-16,vx:(Math.random()-.5)*6,vy:(Math.random()-.5)*6,l:24,c:i%2?'#ffd23f':'#fff'});
+      }
+    }
+  }
+  corn=corn.filter(c=>!c.got);
+  for(const o of obs){
+    if(state!=='run')break;
+    const ob=o.type==='bird'?{x:o.x+4,y:o.y-o.h+6,w:o.w-8,h:o.h-12}:{x:o.x+4,y:o.y-o.h+4,w:o.w-10,h:o.h-4};
+    if(power<=0&&overlap(hb,ob)){
+      dino.vy=-7;dino.onGround=false;dino.duck=false;chickenGone=false;                          // stumble
+      killer=o.type==='bird'?'hawk':'fox';
+      if(o.type==='bird'){state='snatched';snatchT=0;hawk={x:o.x,y:o.y};obs=obs.filter(z=>z!==o);sndHawk()}  // hawk swoops in
+      else{state='eating';eatT=0;sndSquawk()}                                                                // fox pounces
+      if(score>hi){hi=score;try{localStorage.setItem('dinohi',Math.floor(hi))}catch(e){}}
+    }
+  }
+}
+
+function px(x,y,w,h){ctx.fillRect(Math.round(x),Math.round(y),w,h)}
+
+function drawDino(){
+  const {x,y}=dino,ducking=dino.duck&&dino.onGround;
+  const leg=dino.onGround&&(state==='run'||(state==='cutscene'&&cutT>=152))?Math.floor(frames/5)%2:0;
+  const ch=(state==='struck'&&strikeT>=30)||(state==='over'&&killer==='lightning');       // roasted golden-brown after a strike
+  const BODY=ch?'#b8651e':'#d9a441',WING=ch?'#8a4616':'#b9802a',RED=ch?'#6b2a18':'#d93a2f',ORANGE=ch?'#a86a22':'#f08a24';
+  if(ducking){
+    ctx.fillStyle=WING;px(x-2,y-30,8,12);
+    ctx.fillStyle=BODY;px(x+2,y-26,36,16);px(x+30,y-34,14,14);
+    ctx.fillStyle=WING;px(x+10,y-22,14,8);
+    ctx.fillStyle=RED;px(x+33,y-39,3,5);px(x+37,y-37,3,3);px(x+40,y-20,3,4);
+    ctx.fillStyle=ORANGE;px(x+44,y-29,5,4);
+    px(x+10,y-10,3,10-leg*3);px(x+24,y-10,3,7+leg*3);
+    ctx.fillStyle=color();px(x+37,y-30,3,3);
+  }else{
+    ctx.fillStyle=WING;px(x,y-36,7,14);px(x-4,y-40,6,10);   // tail
+    ctx.fillStyle=BODY;px(x+6,y-30,26,20);px(x+10,y-12,18,4); // body
+    px(x+26,y-44,12,18);                                      // head
+    ctx.fillStyle=WING;px(x+12,y-26,12,10);                   // wing
+    ctx.fillStyle=RED;px(x+28,y-49,3,6);px(x+32,y-47,3,4);px(x+36,y-34,3,5); // comb+wattle
+    ctx.fillStyle=ORANGE;px(x+38,y-39,6,4);                   // beak
+    px(x+14,y-8,3,8-leg*3);px(x+24,y-8,3,5+leg*3);           // legs
+    px(x+14,y-2-leg*3,7,2);px(x+24,y-5+leg*3,7,2);
+    ctx.fillStyle=color();px(x+33,y-40,3,3);                  // eye
+  }
+  ctx.fillStyle=color();
+}
+
+function drawEgg(cx,y,i){
+  const e=(cyO,rx,ry,pad)=>{ctx.beginPath();ctx.ellipse(cx,y-cyO,rx+pad,ry+pad,0,0,Math.PI*2);ctx.fill()};
+  ctx.fillStyle='#b89a64';e(13,11,13,2);e(19,8,12,2);   // outline
+  ctx.fillStyle=i%2?'#f0d9b5':'#f6ecd6';e(13,11,13,0);e(19,8,12,0); // shell
+  ctx.fillStyle='#ffffff';px(cx-6,y-27,3,6);px(cx-6,y-19,2,2);  // highlight
+  ctx.fillStyle='#b89a64';px(cx+3,y-16,2,2);px(cx+6,y-10,2,2);px(cx-2,y-7,2,2); // speckles
+  ctx.fillStyle=color();
+}
+function drawNest(o){
+  const n=o.n,nw=34*n,rx=nw/2,mx=o.x+rx,y=o.y,cy=y-7;
+  ctx.fillStyle='#5e3a17';ctx.beginPath();ctx.ellipse(mx,cy,rx,7,0,0,Math.PI*2);ctx.fill();   // back rim
+  for(let i=0;i<n;i++)drawEgg(o.x+17+i*34,y-3,i);                                            // eggs inside
+  ctx.fillStyle='#9a6a35';ctx.beginPath();ctx.ellipse(mx,cy,rx,7,0,0,Math.PI);ctx.fill();    // front of nest
+  ctx.fillStyle='#c9a062';                                                                   // straw
+  const cnt=3*n+1;
+  for(let k=0;k<cnt;k++){const t=(k+0.5)/cnt;px(mx-0.75*rx+t*1.45*rx,y-5+(k%3)*2,6+(k%2)*2,2)}
+  ctx.fillStyle='#7a4f22';px(o.x-3,y-10,5,2);px(o.x+nw-2,y-11,5,2);px(o.x+4,y-2,4,2);          // sticks
+  ctx.fillStyle=color();
+}
+function drawHawk(x,y,ft=frames,carry=false){
+  const up=Math.floor(ft/8)%2===0;
+  ctx.fillStyle='#c0401c';px(x+36,y-21,14,8);px(x+46,y-21,4,8);     // rusty red tail
+  ctx.fillStyle='#6b4423';px(x+12,y-24,24,12);px(x+2,y-28,12,11);   // body + head
+  ctx.fillStyle='#e9dcc0';px(x+14,y-17,20,5);                        // pale belly
+  ctx.fillStyle='#f2c230';px(x-4,y-24,7,3);px(x-4,y-21,3,3);        // hooked beak
+  // WW1 pilot gear: leather cap, goggles, flowing white scarf
+  ctx.fillStyle='#7a4a1e';px(x+1,y-31,14,5);px(x+10,y-27,5,8);       // cap with ear flap
+  ctx.fillStyle='#2b1a0f';px(x+1,y-26,14,2);                         // goggle strap
+  blob(x+6,y-24,4.5,4.5,'#c9a227');                                   // brass rim
+  blob(x+6,y-24,3,3,'#8fd3ff');                                       // lens
+  ctx.fillStyle='#fff';px(x+5,y-26,2,1);                              // glint
+  ctx.fillStyle='#f4f1ea';px(x+12,y-19,9,3);px(x+20,y-18+(up?-2:2),8,2);px(x+27,y-18+(up?-3:3),5,2); // scarf
+  ctx.fillStyle='#4e2f14';                                           // wings
+  if(up){px(x+14,y-38,16,16);px(x+28,y-36,6,10)}
+  else{px(x+14,y-16,22,6);px(x+18,y-10,14,10)}
+  if(carry){ctx.fillStyle='#f2c230';px(x+17,y-12,3,16);px(x+24,y-12,3,16);px(x+15,y+2,7,2);px(x+22,y+2,7,2)} // talons gripping the chicken
+  ctx.fillStyle=color();
+}
+// ---- predator variety: each restart picks fox, black bear, coyote or raccoon ----
+const PREDS=['fox','bear','coyote','raccoon'];
+let pred=PREDS[Math.floor(Math.random()*PREDS.length)];
+function pickPred(){const others=PREDS.filter(p=>p!==pred);pred=others[Math.floor(Math.random()*others.length)]}   // never the same animal twice in a row
+// rects are [x, y, w, h, colour] in the animal's own units (feet at y=0, facing right), scaled by S
+const PRED={
+  bear:{S:2.2,shift:-55,legX:[8,17,32,41],legW:7,legTop:-15,legLen:15,legLenSad:12,legCol:'#2b2420',pawCol:'#17120f',
+    body:[[6,-34,40,20,'#3b2f2a'],[28,-39,16,7,'#3b2f2a'],[8,-34,36,2,'#5a4a42']],
+    tail:[[2,-30,6,6,'#3b2f2a']],tailS:[[2,-22,6,6,'#3b2f2a']],
+    head:[[44,-38,17,17,'#3b2f2a'],[56,-31,9,9,'#b8895a'],[63,-31,3,3,'#111'],[52,-32,2,2,'#e8d6a8']],
+    earCol:'#3b2f2a',ears:[[46,-42,6,5],[54,-42,6,5]],jaws:[57,-24,8,3],feather:[55,-24,5,2]},
+  coyote:{S:1.5,legX:[10,17,28,35],legW:4,legTop:-14,legLen:14,legLenSad:12,legCol:'#a08660',pawCol:'#4a4034',
+    body:[[10,-27,27,11,'#b09670'],[12,-19,23,3,'#d8c8a8']],
+    tail:[[0,-27,10,6,'#b09670'],[-3,-23,8,10,'#b09670'],[-3,-14,8,4,'#4a4034']],
+    tailS:[[1,-21,8,6,'#b09670'],[-1,-17,6,10,'#b09670'],[-1,-9,6,3,'#4a4034']],
+    head:[[35,-32,12,12,'#b09670'],[47,-28,9,5,'#b09670'],[40,-24,8,3,'#d8c8a8'],[55,-28,3,3,'#222'],[42,-29,2,2,'#222']],
+    earCol:'#b09670',ears:[[36,-42,4,10],[43,-42,4,10]],jaws:[48,-23,8,3],feather:[46,-23,4,2]},
+  raccoon:{S:1.6,legX:[10,18,26,33],legW:5,legTop:-13,legLen:13,legLenSad:11,legCol:'#3a3a3a',pawCol:'#222',
+    body:[[9,-26,30,13,'#8a8d94'],[12,-17,24,3,'#a8aab0']],
+    tail:[[-8,-28,17,8,'#8a8d94'],[-8,-28,2,8,'#2a2a2a'],[-5,-28,3,8,'#2a2a2a'],[0,-28,3,8,'#2a2a2a'],[6,-28,3,8,'#2a2a2a']],
+    tailS:[[0,-22,8,6,'#8a8d94'],[-2,-17,6,10,'#8a8d94'],[-2,-13,6,2,'#2a2a2a'],[-2,-8,6,2,'#2a2a2a']],
+    head:[[36,-31,14,13,'#9a9da4'],[37,-27,13,5,'#222'],[46,-22,6,5,'#e8e8e8'],[52,-23,3,3,'#111'],[44,-26,2,2,'#fff']],
+    earCol:'#8a8d94',ears:[[38,-35,4,4],[45,-35,4,4]],jaws:[47,-18,6,3],feather:[45,-18,4,2]}
+};
+function drawOtherPred(sp,x,y,a,air,sad){
+  const S=sp.S,ox=x+(sp.shift||0);
+  const q=(dx,dy,w,h)=>{const x0=Math.round(ox+dx*S),y0=Math.round(y+dy*S),x1=Math.round(ox+(dx+w)*S),y1=Math.round(y+(dy+h)*S);ctx.fillRect(x0,y0,x1-x0,y1-y0)};
+  const R=(r,dy)=>{ctx.fillStyle=r[4];q(r[0],r[1]+dy,r[2],r[3])};
+  const bdy=sad?2:0,hdy=sad?6:0;
+  const f1=air?6:sp.legLen-a*5,f2=air?6:sp.legLen-5+a*5;
+  const lens=sad?[sp.legLenSad,sp.legLenSad,sp.legLenSad,sp.legLenSad]:[f1,f2,f2,f1];
+  ctx.fillStyle=sp.legCol;sp.legX.forEach((lx,i)=>q(lx,sp.legTop,sp.legW,lens[i]));              // legs
+  ctx.fillStyle=sp.pawCol;sp.legX.forEach((lx,i)=>q(lx-1,sp.legTop+lens[i]-3,sp.legW+3,3));       // paws
+  sp.body.forEach(r=>R(r,bdy));                                                                    // body (sags when sad)
+  (sad?sp.tailS:sp.tail).forEach(r=>R(r,0));                                                       // tail (limp when sad)
+  sp.head.forEach(r=>R(r,hdy));                                                                    // head and face (hangs low when sad, face itself unchanged)
+  ctx.fillStyle=sp.earCol;
+  sp.ears.forEach((e,i)=>{if(sad){q(e[0],e[1]+8,e[2],e[3]-2);q(i?e[0]+e[2]-1:e[0]-2,e[1]+9,3,3)}else q(e[0],e[1],e[2],e[3])});   // ears droop slightly when sad
+  if(sad){ctx.fillStyle=color();ctx.font='14px "Courier New",monospace';ctx.textAlign='left';ctx.fillText('*sigh*',x+105,GY-60);return}
+  const open=(state==='eating'&&(eatT<28||Math.floor(eatT/5)%2))||(state==='snatched'&&snatchT<40)||(state==='cutscene'&&cutT>=118&&cutT<158);
+  if(open){ctx.fillStyle='#fff';q(sp.jaws[0],sp.jaws[1],sp.jaws[2],sp.jaws[3])}                  // open jaws
+  if(state==='over'&&eatT>0){ctx.fillStyle='#f4f1ea';q(sp.feather[0],sp.feather[1],sp.feather[2],sp.feather[3])}   // feather on its mouth
+  ctx.fillStyle=color();
+}
+const FS=1.6,FOXD=106; // fox scale, distance behind the chicken
+function drawFoxR(){
+  const fgy=groundAt(fox.x+40);
+  let y=(state==='over'||state==='eating'||state==='snatched'||state==='struck'||!hist.length)?fgy:fgy+hist[Math.max(0,hist.length-1-Math.round(FOXD/speed))];
+  y-=foxLift;                                                         // pounce height
+  if(state==='snatched'&&snatchT>=16&&snatchT<40)y-=Math.round(Math.abs(Math.sin((snatchT-16)*0.2))*28); // fox leaps after the hawk
+  if(state==='eating'&&eatT>=28)y+=Math.round(Math.sin(eatT*0.9)*2); // chewing bob
+  const fleeing=state==='struck'&&strikeT>=12;
+  const x=fox.x,run=state==='run'||(state==='cutscene'&&cutT>=152)||fleeing,a=run?Math.floor((fleeing?strikeT*1.6:frames)/5)%2:0,air=y<fgy-2;
+  // scaled rect with rounded edges so neighbouring parts stay seamless
+  const q=(dx,dy,w,h)=>{const x0=Math.round(x+dx*FS),y0=Math.round(y+dy*FS),x1=Math.round(x+(dx+w)*FS),y1=Math.round(y+(dy+h)*FS);ctx.fillRect(x0,y0,x1-x0,y1-y0)};
+  const sad=(state==='snatched'&&snatchT>=48)||(state==='over'&&killer==='hawk');
+  if(pred!=='fox'){drawOtherPred(PRED[pred],x,y,a,air,sad);return}
+  if(sad){                                                          // sad, defeated fox: body language only, face unchanged
+    ctx.fillStyle='#b5530f';q(10,-14,5,12);q(18,-14,5,12);q(26,-14,5,12);q(33,-14,5,12);       // legs
+    ctx.fillStyle='#5a2e0e';q(10,-5,8,3);q(18,-5,8,3);q(26,-5,8,3);q(33,-5,8,3);                // paws
+    ctx.fillStyle='#e8731a';q(10,-24,28,12);q(36,-26,14,14);q(2,-20,8,6);q(0,-16,6,10);          // sagging body, low head, limp tail
+    ctx.fillStyle='#fff';q(0,-8,6,3);q(34,-16,6,6);                                              // tail tip, chest
+    ctx.fillStyle='#e8731a';q(38,-30,4,4);q(45,-30,4,4);q(36,-29,3,3);q(48,-29,3,3);             // ears slightly drooped: shorter, tips folding out
+    ctx.fillStyle='#4a2a12';q(50,-21,4,4);q(44,-22,2,2);                                          // normal nose and eye
+    ctx.fillStyle=color();ctx.font='14px "Courier New",monospace';ctx.textAlign='left';ctx.fillText('*sigh*',x+105,GY-60);
+    return;
+  }
+  const f1=air?6:14-a*5,f2=air?6:9+a*5;
+  ctx.fillStyle='#b5530f';
+  q(10,-14,5,f1);q(18,-14,5,f2);q(26,-14,5,f2);q(33,-14,5,f1);
+  ctx.fillStyle='#5a2e0e';
+  q(10,-14+f1-3,8,3);q(18,-14+f2-3,8,3);q(26,-14+f2-3,8,3);q(33,-14+f1-3,8,3);
+  ctx.fillStyle='#e8731a';
+  q(10,-26,28,12);                // body
+  q(36,-32,14,14);                // head
+  q(38,-38,4,6);q(45,-38,4,6);    // ears
+  q(2,-28,8,8);                   // tail
+  ctx.fillStyle='#fff';
+  q(-2,-28,4,8);                  // tail tip
+  q(34,-20,6,6);                  // chest
+  ctx.fillStyle='#4a2a12';
+  q(50,-27,4,4);                  // nose
+  q(44,-28,2,2);                  // eye
+  if(state==='eating'&&(eatT<28||Math.floor(eatT/5)%2)){ctx.fillStyle='#fff';q(46,-22,6,3)}  // open jaws
+  if(state==='snatched'&&snatchT<40){ctx.fillStyle='#fff';q(46,-22,6,3)}
+  if(state==='cutscene'&&cutT>=118&&cutT<158){ctx.fillStyle='#fff';q(46,-22,6,3)}   // jaws open mid-pounce
+  if(state==='over'&&eatT>0){ctx.fillStyle='#f4f1ea';q(44,-21,4,2)}                                   // feather stuck on its mouth
+  ctx.fillStyle=color();
+}
+function drawCorn(x,y){
+  ctx.fillStyle='#4caf50';px(x,y-14,5,14);px(x+9,y-14,5,14);px(x+4,y-8,6,8);        // husk leaves
+  ctx.fillStyle='#2f7d2e';px(x+5,y,4,4);                                              // stem
+  ctx.fillStyle='#f7c72a';px(x+3,y-30,8,22);px(x+4,y-32,6,3);px(x+2,y-26,10,14);     // cob
+  ctx.fillStyle='#d99a10';
+  for(let r=0;r<6;r++){px(x+4,y-29+r*4,2,2);px(x+8,y-29+r*4,2,2);px(x+6,y-27+r*4,2,2)}  // kernels
+  ctx.fillStyle='#fff6b0';px(x+4,y-28,1,6);                                           // shine
+  ctx.fillStyle=color();
+}
+function drawObs(o){
+  if(o.type==='egg'){drawNest(o)}
+  else drawHawk(o.x,o.y); // red-tailed hawk
+}
+
+const _sh={};
+function shade(hex,dk){
+  if(!dk)return hex;
+  if(_sh[hex])return _sh[hex];
+  const n=parseInt(hex.slice(1),16),r=(n>>16)&255,g=(n>>8)&255,b=n&255;
+  return _sh[hex]='rgb('+Math.round(r*.42)+','+Math.round(g*.46)+','+Math.round(b*.6)+')';
+}
+function blob(cx,cy,rx,ry,col){ctx.fillStyle=col;ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.fill()}
+function drawBackground(){
+  const dk=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()==='#202124';
+  const c=h=>shade(h,dk);
+  // sky
+  const gr=ctx.createLinearGradient(0,0,0,GY);
+  gr.addColorStop(0,dk?'#0d1526':'#8ccbf2');gr.addColorStop(1,dk?'#1e2c47':'#e4f3ff');
+  ctx.fillStyle=gr;ctx.fillRect(X0,0,X1-X0,H);
+  blob(610,52,15,15,dk?'#e9e6c8':'#ffe27a');                       // sun / moon
+  // clouds
+  ctx.globalAlpha=dk?0.25:0.9;ctx.fillStyle=dk?'#8aa0c0':'#ffffff';
+  clouds.forEach(cl=>{px(cl.x,cl.y,50,10);px(cl.x+10,cl.y-8,30,10)});
+  ctx.globalAlpha=1;
+  // far and near rolling hills
+  for(let x=X0;x<X1;x+=4){
+    const yf=GY-44-10*Math.sin((x+dist*0.05)/90)-6*Math.sin((x+dist*0.05)/37);
+    ctx.fillStyle=c('#b9dcae');ctx.fillRect(x,yf,4,H-yf);
+  }
+  for(let x=X0;x<X1;x+=4){
+    const yn=GY-26-10*Math.sin((x+dist*0.12)/70)-5*Math.sin((x+dist*0.12)/29);
+    ctx.fillStyle=c('#8fc785');ctx.fillRect(x,yn,4,H-yn);
+  }
+  // farmyard tile (repeats every 800px, scrolls slower than the ground)
+  const P=800,off=-((dist*0.25)%P);
+  for(let t=-1;t<2;t++){
+    const o=off+t*P;
+    const bx=o+60;                                                  // barn
+    ctx.fillStyle=c('#b23a2e');ctx.fillRect(bx,GY-40,64,40);
+    ctx.fillStyle=c('#7a2a22');ctx.beginPath();ctx.moveTo(bx-6,GY-40);ctx.lineTo(bx+32,GY-66);ctx.lineTo(bx+70,GY-40);ctx.fill();
+    ctx.fillStyle=c('#f3efe6');ctx.fillRect(bx+22,GY-24,20,24);ctx.fillRect(bx+27,GY-50,10,8);
+    ctx.fillStyle=c('#b23a2e');ctx.fillRect(bx+24,GY-22,16,22);
+    ctx.strokeStyle=c('#f3efe6');ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(bx+24,GY-22);ctx.lineTo(bx+40,GY);ctx.moveTo(bx+40,GY-22);ctx.lineTo(bx+24,GY);ctx.stroke();
+    const sx=bx+88;                                                 // silo
+    ctx.fillStyle=c('#c9ccd1');ctx.fillRect(sx,GY-56,18,56);blob(sx+9,GY-56,9,7,c('#aeb2b8'));
+    ctx.fillStyle=c('#a4a8ae');ctx.fillRect(sx,GY-40,18,2);ctx.fillRect(sx,GY-24,18,2);
+    for(const tx of [o+290,o+700]){                                 // trees
+      ctx.fillStyle=c('#6b4a2b');ctx.fillRect(tx+8,GY-22,6,22);
+      blob(tx+11,GY-34,18,16,c('#3f8f3b'));blob(tx+5,GY-38,9,8,c('#56a84f'));
+    }
+    const wx=o+450;                                                 // windmill
+    ctx.fillStyle=c('#9b6b3c');ctx.beginPath();ctx.moveTo(wx,GY);ctx.lineTo(wx+20,GY);ctx.lineTo(wx+14,GY-50);ctx.lineTo(wx+6,GY-50);ctx.fill();
+    ctx.strokeStyle=c('#e8e2d4');ctx.lineWidth=3;const ang=frames*0.06;
+    for(let k=0;k<4;k++){const a=ang+k*Math.PI/2;ctx.beginPath();ctx.moveTo(wx+10,GY-52);ctx.lineTo(wx+10+Math.cos(a)*24,GY-52+Math.sin(a)*24);ctx.stroke()}
+    blob(wx+10,GY-52,3,3,c('#6b4a2b'));
+    const hx=o+590;                                                 // haystack
+    ctx.fillStyle=c('#e3c15a');ctx.beginPath();ctx.ellipse(hx+18,GY,18,17,0,Math.PI,2*Math.PI);ctx.fill();
+    ctx.strokeStyle=c('#c49b38');ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(hx+6,GY-2);ctx.lineTo(hx+12,GY-14);ctx.moveTo(hx+18,GY-2);ctx.lineTo(hx+18,GY-16);ctx.moveTo(hx+30,GY-2);ctx.lineTo(hx+24,GY-14);ctx.stroke();
+  }
+  // wooden fence, closer so it scrolls faster
+  const fo=-((dist*0.6)%40);
+  ctx.globalAlpha=0.75;ctx.fillStyle=c('#a9794a');
+  ctx.fillRect(X0,GY-14,X1-X0,2);ctx.fillRect(X0,GY-7,X1-X0,2);
+  for(let x=fo+Math.floor(X0/40)*40;x<X1+40;x+=40)ctx.fillRect(Math.round(x),GY-18,4,18);
+  ctx.globalAlpha=1;
+}
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  const fg=color();ctx.fillStyle=fg;
+  const cut=state==='cutscene';
+  if(cut){const cm=camera();ctx.save();ctx.translate(cm.sx,cm.sy);ctx.scale(cm.z,cm.z);ctx.translate(-160,-185);X0=-150;X1=W+150}
+  else{X0=0;X1=W}
+  drawBackground();
+  ctx.fillStyle=fg;
+  // ground: rolling soil with scrolling grass (cosmetic)
+  for(let x=X0;x<X1;x+=4){
+    const gy=Math.round(groundAt(x+2));
+    ctx.fillStyle='#6b4a2b';ctx.fillRect(x,gy+4,4,H-gy);            // soil
+    ctx.fillStyle='#3f9b3a';ctx.fillRect(x,gy-1,4,6);               // grass band
+    ctx.fillStyle='#2f7d2e';ctx.fillRect(x,gy+3,4,2);               // shaded edge
+  }
+  ctx.globalAlpha=0.35;ctx.fillStyle='#3d2a16';
+  for(let i=0;i<14;i++){const gx=((i*67-dist*0.9)%W+W)%W;px(gx,groundAt(gx)+10+(i%3)*7,6+(i%4)*3,2)}
+  ctx.globalAlpha=1;
+  const sp=22,base=Math.floor(dist/sp);
+  for(let i=Math.floor(X0/sp)-1;i<=X1/sp+1;i++){
+    const k=base+i,r=((k*2654435761)>>>0)%1000,x=Math.round(i*sp-(dist%sp));
+    const gb=Math.round(groundAt(x+5));
+    const h1=6+r%9,h2=5+(r>>3)%8,h3=4+(r>>5)%7;
+    ctx.fillStyle='#4caf50';px(x,gb-h1,2,h1);px(x+5,gb-h2,2,h2);
+    ctx.fillStyle='#66c25a';px(x+9,gb-h3,2,h3);px(x+2,gb-h1+2,1,2);
+    if(r%11===0){ctx.fillStyle='#ffd23f';px(x+4,gb-h2-3,3,3);ctx.fillStyle='#fff';px(x+5,gb-h2-2,1,1)} // little flower
+  }
+  ctx.fillStyle=fg;
+  corn.forEach(c=>{                                                  // bobbing corn cob
+    const by=Math.round(Math.sin(frames*0.12+c.x*0.05)*3);
+    drawCorn(c.x,c.y+by);
+  });
+  obs.forEach(drawObs);
+  const bearFront=cut&&pred==='bear'&&cutT>=132;                      // the bear bursts out in front of the bush
+  if(!(cut&&cutT<116)&&!bearFront){                                  // predator stays hidden until it pounces
+    const fl=state==='struck'&&strikeT>=12;                          // fleeing: mirror the sprite so it runs away facing left
+    if(fl){const FC={fox:41,bear:18,coyote:42,raccoon:38};ctx.save();ctx.translate(2*(fox.x+FC[pred]),0);ctx.scale(-1,1)}
+    drawFoxR();
+    if(fl)ctx.restore();
+    if(state==='struck'&&strikeT<12){ctx.font='bold 22px "Courier New",monospace';ctx.textAlign='center';ctx.fillStyle='#d93a2f';ctx.fillText('!',fox.x+55,groundAt(fox.x+40)-(pred==='bear'?120:84)-foxLift);ctx.fillStyle=fg}
+  }
+  if(cut)drawBush();
+  if(bearFront)drawFoxR();                                                 // bush hides the fox until it pounces
+  if(!chickenGone){
+    if(power>0){                                                     // golden invincibility aura
+      const pr=34+Math.sin(performance.now()/120)*4;
+      blob(dino.x+20,dino.y-24,pr,pr*1.1,'rgba(255,214,64,0.28)');blob(dino.x+20,dino.y-24,pr*.65,pr*.72,'rgba(255,240,150,0.25)');
+    }
+    if(power>0&&power<1000&&Math.floor(power/120)%2)ctx.globalAlpha=0.45;   // blink when about to run out
+    ctx.save();if(state==='eating')ctx.translate(Math.round(Math.sin(eatT*1.6)*2),0);if(state==='snatched'&&snatchT<16)ctx.translate(Math.round(Math.sin(snatchT*1.6)*2),0);if(state==='struck'&&strikeT<40)ctx.translate(Math.round(Math.sin(strikeT*2.5)*3),0);
+    if(cut&&cutT<100)drawChickenPeck(cutT);else if(state==='struck'&&strikeT<30&&Math.floor(strikeT/3)%2===0)drawSkeleton();
+    else if(state==='struck'&&strikeT>=30&&strikeT<50){                               // topples backwards, gaining speed
+      const k=(strikeT-30)/20,a=-(k*k)*1.65;
+      ctx.save();ctx.translate(dino.x+8,dino.y);ctx.rotate(a);ctx.translate(-(dino.x+8),-dino.y);drawDino();ctx.restore();
+    }
+    else if(state==='struck'&&strikeT>=50)drawCooked(strikeT<58?-Math.round(7*Math.sin((strikeT-50)/8*Math.PI)):0);   // lands on its back with a little bounce
+    else if(state==='over'&&killer==='lightning')drawCooked();
+    else drawDino();ctx.restore();ctx.globalAlpha=1;
+    if(state==='eating'||(state==='snatched'&&snatchT<16)){ctx.font='bold 22px "Courier New",monospace';ctx.textAlign='center';ctx.fillStyle='#d93a2f';ctx.fillText('!',dino.x+22,dino.y-56)}
+  }
+  if(cut&&cutT>=108&&cutT<150){ctx.font='bold 22px "Courier New",monospace';ctx.textAlign='center';ctx.fillStyle='#d93a2f';ctx.fillText('!',dino.x+22,dino.y-60)}
+  if(state==='snatched'&&hawk){
+    drawHawk(hawk.x,hawk.y,snatchT*2,snatchT>=12);
+    if(snatchT>=10){ctx.font='bold 13px "Courier New",monospace';ctx.textAlign='center';ctx.fillStyle='#d93a2f';ctx.fillText('SQUAWK!',dino.x+22,dino.y-62)}
+  }
+  sparks.forEach(p=>{ctx.fillStyle=p.c;px(p.x,p.y,3,3)});
+  particles.forEach(p=>{ctx.fillStyle=p.c;px(p.x,p.y,4,2);ctx.fillStyle='#b89a64';px(p.x,p.y+2,2,1)});
+  ctx.fillStyle=fg;
+  if(state==='eating'&&eatT>=55){ctx.font='bold 14px "Courier New",monospace';ctx.textAlign='center';ctx.fillText('*gulp*',fox.x+72,GY-(pred==='bear'?130:90))}
+  if(cut){ctx.restore();drawCutOverlay();return}
+  if(state==='struck'||(state==='over'&&killer==='lightning'))drawStrike();
+  // HUD
+  ctx.font='bold 18px "Courier New",monospace';ctx.textAlign='right';
+  ctx.fillText(('HI '+String(Math.floor(hi)).padStart(5,'0')+'  '+String(Math.floor(score)).padStart(5,'0')),W-16,28);
+  if(power>0&&state==='run'){                                        // corn power timer bar
+    ctx.fillStyle='rgba(0,0,0,0.25)';px(16,28,120,8);ctx.fillStyle='#f7c72a';px(16,28,Math.round(120*power/3000),8);ctx.fillStyle=fg;
+  }
+  ctx.textAlign='center';
+  if(state==='idle'){ctx.fillText('Press SPACE or tap to start',W/2,110)}
+  if(state==='over'){
+    ctx.font='bold 28px "Courier New",monospace';ctx.fillText('G A M E  O V E R',W/2,100);
+    ctx.font='16px "Courier New",monospace';ctx.fillText('Press SPACE or tap to restart',W/2,130);
+  }
+}
+
+let lastTs=0;
+function loop(ts){const dt=lastTs&&ts?Math.min(50,ts-lastTs):16.7;lastTs=ts||0;update(dt);draw();requestAnimationFrame(loop)}
+reset();state='idle';loop();
+</script>
+</body>
+</html>
