@@ -22,7 +22,7 @@ const cv=document.getElementById('c'),ctx=cv.getContext('2d');
 const W=800,H=260,GY=215,G=0.65;
 // gently rolling terrain: height of the ground surface at screen x (scrolls with distance travelled)
 let strikeChance=0.02,strikeT=0,bolt=[];            // chance (0 to 1) that grabbing corn gets the chicken struck by lightning; currently 2%
-const START_SPEED=3.5;                          // gentle opening pace; speeds up gradually as the score climbs
+const START_SPEED=5;                          // gentle opening pace; speeds up gradually as the score climbs
 const CD0=160;                                   // starting scroll offset for the cutscene (frames the farm nicely behind the chicken)
 let X0=0,X1=W,cutT=0,cutSpeed=0,foxLift=0; // visible world range (wider in the cutscene), cutscene clock, fox pounce height
 function groundAt(x){return GY-12*Math.sin((x+dist)/230)-5*Math.sin((x+dist)/95)}
